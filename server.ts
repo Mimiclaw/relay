@@ -1,9 +1,14 @@
 #!/usr/bin/env node
 import http, { IncomingMessage, ServerResponse } from "http";
+import fs from "fs";
+import os from "os";
+import path from "path";
 import { randomBytes, randomUUID } from "crypto";
 import WebSocket = require("ws");
+import Nedb from "@seald-io/nedb";
 
 type Role = "boss" | "employee";
+type ConnectionStatus = "online" | "offline" | "banned";
 
 type ClientAuthMessage = {
   type: "auth";
@@ -40,11 +45,56 @@ type IdentityRecord = {
   socket?: WebSocket;
 };
 
+type IdentityDoc = {
+  _id: string;
+  id: string;
+  role: Role;
+  key: string;
+  banned: boolean;
+  createdAt: number;
+  lastSeen: number;
+  status: ConnectionStatus;
+  lastConnectedAt?: number;
+  lastDisconnectedAt?: number;
+  updatedAt: number;
+  meta?: Record<string, unknown>;
+};
+
+type ConnectionEventDoc = {
+  _id: string;
+  identityId: string;
+  role: Role;
+  event: "auth_ok" | "reconnect" | "disconnect" | "ban" | "unban" | "auth_fail";
+  reason?: string;
+  timestamp: number;
+  online: boolean;
+  meta?: Record<string, unknown>;
+};
+
+type MessageLogDoc = {
+  _id: string;
+  msgId: string;
+  fromId: string;
+  fromRole: Role;
+  requestedTargets: string[];
+  resolvedTargets: string[];
+  delivered: string[];
+  failed: Array<{ id: string; reason: string }>;
+  payload: unknown;
+  timestamp: number;
+};
+
 const args = parseArgs(process.argv.slice(2));
 const PORT = args.port ?? 8787;
 const HOST = args.host ?? "0.0.0.0";
 const WS_PATH = args.wsPath ?? "/ws";
 const AUTH_KEY = args.authkey ?? process.env.MIMICLAW_AUTHKEY;
+const RELAY_HOME = resolveRelayHome(args.dataDir ?? process.env.MIMICLAW_RELAY_HOME);
+const DB_FILES = {
+  identities: path.join(RELAY_HOME, "identities.db"),
+  connections: path.join(RELAY_HOME, "connections.db"),
+  messages: path.join(RELAY_HOME, "messages.db"),
+};
 
 if (!AUTH_KEY) {
   console.error("Missing auth key. Use --authkey=<value> or env MIMICLAW_AUTHKEY.");
@@ -53,6 +103,9 @@ if (!AUTH_KEY) {
 
 const identities = new Map<string, IdentityRecord>();
 const socketToIdentity = new Map<WebSocket, string>();
+let identitiesDb: Nedb<IdentityDoc>;
+let connectionsDb: Nedb<ConnectionEventDoc>;
+let messagesDb: Nedb<MessageLogDoc>;
 
 const server = http.createServer(handleHttp);
 const wss = new WebSocket.Server({ noServer: true });
@@ -101,6 +154,17 @@ wss.on("connection", (ws) => {
       }
       const result = authenticateSocket(ws, msg);
       if (result.ok === false) {
+        fireAndForget(
+          persistConnectionEvent({
+            identityId: msg.identity?.id ?? "unknown",
+            role: msg.role,
+            event: "auth_fail",
+            reason: result.message,
+            online: false,
+            meta: msg.meta,
+          }),
+          "persist auth_fail event",
+        );
         sendError(ws, result.code, result.message);
         safeClose(ws, 4003, result.message);
         return;
@@ -108,6 +172,23 @@ wss.on("connection", (ws) => {
 
       authed = true;
       clearTimeout(authTimer);
+      fireAndForget(
+        persistIdentity(result.identity, {
+          status: computeStatus(result.identity),
+          lastConnectedAt: Date.now(),
+        }),
+        "persist identity after auth",
+      );
+      fireAndForget(
+        persistConnectionEvent({
+          identityId: result.identity.id,
+          role: result.identity.role,
+          event: result.reconnected ? "reconnect" : "auth_ok",
+          online: true,
+          meta: result.identity.meta,
+        }),
+        "persist auth event",
+      );
       sendJson(ws, {
         type: "auth_ok",
         id: result.identity.id,
@@ -162,28 +243,58 @@ wss.on("connection", (ws) => {
     if (identity.socket === ws) {
       identity.socket = undefined;
       identity.lastSeen = Date.now();
+      fireAndForget(
+        persistIdentity(identity, {
+          status: computeStatus(identity),
+          lastDisconnectedAt: Date.now(),
+        }),
+        "persist identity on disconnect",
+      );
+      fireAndForget(
+        persistConnectionEvent({
+          identityId: identity.id,
+          role: identity.role,
+          event: "disconnect",
+          online: false,
+        }),
+        "persist disconnect event",
+      );
     }
   });
 });
 
-server.listen(PORT, HOST, () => {
-  console.log(
-    JSON.stringify(
-      {
-        service: "mimiclaw-websocket",
-        status: "listening",
-        host: HOST,
-        port: PORT,
-        ws_path: WS_PATH,
-      },
-      null,
-      2,
-    ),
-  );
-});
+void bootstrap();
 
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
+
+async function bootstrap() {
+  try {
+    ensureRelayHome(RELAY_HOME);
+    await initDatastores();
+    await restoreIdentitiesFromDisk();
+
+    server.listen(PORT, HOST, () => {
+      console.log(
+        JSON.stringify(
+          {
+            service: "mimiclaw-websocket",
+            status: "listening",
+            host: HOST,
+            port: PORT,
+            ws_path: WS_PATH,
+            relay_home: RELAY_HOME,
+          },
+          null,
+          2,
+        ),
+      );
+    });
+  } catch (err) {
+    console.error("Failed to bootstrap datastore:", err);
+    process.exit(1);
+  }
+}
 
 function shutdown() {
   for (const ws of socketToIdentity.keys()) {
@@ -204,6 +315,7 @@ function handleHttp(req: IncomingMessage, res: ServerResponse) {
       service: "mimiclaw-websocket",
       now: Date.now(),
       active_connections: socketToIdentity.size,
+      relay_home: RELAY_HOME,
     });
   }
 
@@ -217,6 +329,12 @@ function handleHttp(req: IncomingMessage, res: ServerResponse) {
   if (path === "/employees" && method === "GET") {
     return writeJson(res, 200, {
       employees: listEmployees(),
+    });
+  }
+
+  if (path === "/connections" && method === "GET") {
+    return writeJson(res, 200, {
+      connections: listConnections(),
     });
   }
 
@@ -270,6 +388,25 @@ function listEmployees() {
       id: identity.id,
       role: identity.role,
       online: isOnline(identity),
+      status: computeStatus(identity),
+      banned: identity.banned,
+      created_at: identity.createdAt,
+      last_seen: identity.lastSeen,
+      meta: identity.meta ?? null,
+    });
+  }
+  rows.sort((a, b) => String(a.id).localeCompare(String(b.id)));
+  return rows;
+}
+
+function listConnections() {
+  const rows: Array<Record<string, unknown>> = [];
+  for (const identity of identities.values()) {
+    rows.push({
+      id: identity.id,
+      role: identity.role,
+      online: isOnline(identity),
+      status: computeStatus(identity),
       banned: identity.banned,
       created_at: identity.createdAt,
       last_seen: identity.lastSeen,
@@ -326,7 +463,9 @@ function authenticateSocket(
     }
     existing.socket = ws;
     existing.lastSeen = Date.now();
-    existing.meta = msg.meta;
+    if (msg.meta) {
+      existing.meta = msg.meta;
+    }
     socketToIdentity.set(ws, existing.id);
     return { ok: true, identity: existing, reconnected: true };
   }
@@ -362,6 +501,10 @@ function routeMessage(sender: IdentityRecord, msg: ClientRouteMessage, ws: WebSo
   const delivered: string[] = [];
   const failed: Array<{ id: string; reason: string }> = [];
   const finalTargets = expandTargets(targets, sender.id);
+  fireAndForget(
+    persistIdentity(sender, { status: computeStatus(sender) }),
+    "persist sender activity",
+  );
 
   for (const targetId of finalTargets) {
     const target = identities.get(targetId);
@@ -397,6 +540,20 @@ function routeMessage(sender: IdentityRecord, msg: ClientRouteMessage, ws: WebSo
     failed,
     timestamp: Date.now(),
   });
+
+  fireAndForget(
+    persistMessageLog({
+      msgId,
+      fromId: sender.id,
+      fromRole: sender.role,
+      requestedTargets: targets,
+      resolvedTargets: finalTargets,
+      delivered,
+      failed,
+      payload: msg.payload,
+    }),
+    "persist message log",
+  );
 }
 
 function expandTargets(targets: string[], senderId: string) {
@@ -433,6 +590,22 @@ function setEmployeeBan(
   }
   record.banned = banned;
   record.lastSeen = Date.now();
+  fireAndForget(
+    persistIdentity(record, {
+      status: computeStatus(record),
+    }),
+    "persist identity on ban update",
+  );
+  fireAndForget(
+    persistConnectionEvent({
+      identityId: record.id,
+      role: record.role,
+      event: banned ? "ban" : "unban",
+      online: isOnline(record),
+      reason: "boss-http",
+    }),
+    "persist ban event",
+  );
   if (banned && record.socket && record.socket.readyState === WebSocket.OPEN) {
     sendJson(record.socket, {
       type: "system",
@@ -516,12 +689,154 @@ function isOnline(record: IdentityRecord) {
   return !!record.socket && record.socket.readyState === WebSocket.OPEN;
 }
 
+function computeStatus(record: IdentityRecord): ConnectionStatus {
+  if (record.banned) {
+    return "banned";
+  }
+  return isOnline(record) ? "online" : "offline";
+}
+
+function ensureRelayHome(dir: string) {
+  fs.mkdirSync(dir, { recursive: true });
+}
+
+async function initDatastores() {
+  identitiesDb = new Nedb<IdentityDoc>({
+    filename: DB_FILES.identities,
+    autoload: true,
+    timestampData: false,
+  });
+  connectionsDb = new Nedb<ConnectionEventDoc>({
+    filename: DB_FILES.connections,
+    autoload: true,
+    timestampData: false,
+  });
+  messagesDb = new Nedb<MessageLogDoc>({
+    filename: DB_FILES.messages,
+    autoload: true,
+    timestampData: false,
+  });
+
+  await Promise.all([
+    identitiesDb.loadDatabaseAsync(),
+    connectionsDb.loadDatabaseAsync(),
+    messagesDb.loadDatabaseAsync(),
+  ]);
+
+  await Promise.all([
+    identitiesDb.ensureIndexAsync({ fieldName: "id", unique: true }),
+    connectionsDb.ensureIndexAsync({ fieldName: "identityId" }),
+    connectionsDb.ensureIndexAsync({ fieldName: "timestamp" }),
+    messagesDb.ensureIndexAsync({ fieldName: "msgId" }),
+    messagesDb.ensureIndexAsync({ fieldName: "timestamp" }),
+  ]);
+
+  const now = Date.now();
+  await identitiesDb.updateAsync(
+    { banned: false, status: "online" },
+    { $set: { status: "offline", lastDisconnectedAt: now, updatedAt: now } },
+    { multi: true },
+  );
+}
+
+async function restoreIdentitiesFromDisk() {
+  const docs = identitiesDb.getAllData<IdentityDoc>();
+  for (const doc of docs) {
+    const id = doc.id || doc._id;
+    if (!id || (doc.role !== "boss" && doc.role !== "employee") || typeof doc.key !== "string") {
+      continue;
+    }
+    identities.set(id, {
+      id,
+      role: doc.role,
+      key: doc.key,
+      banned: !!doc.banned,
+      createdAt: doc.createdAt ?? Date.now(),
+      lastSeen: doc.lastSeen ?? Date.now(),
+      meta: doc.meta,
+    });
+  }
+}
+
+async function persistIdentity(
+  record: IdentityRecord,
+  extra?: {
+    status?: ConnectionStatus;
+    lastConnectedAt?: number;
+    lastDisconnectedAt?: number;
+  },
+) {
+  const now = Date.now();
+  const updatePayload: Partial<IdentityDoc> = {
+    id: record.id,
+    role: record.role,
+    key: record.key,
+    banned: record.banned,
+    createdAt: record.createdAt,
+    lastSeen: record.lastSeen,
+    meta: record.meta,
+    status: extra?.status ?? computeStatus(record),
+    updatedAt: now,
+  };
+  if (extra?.lastConnectedAt !== undefined) {
+    updatePayload.lastConnectedAt = extra.lastConnectedAt;
+  }
+  if (extra?.lastDisconnectedAt !== undefined) {
+    updatePayload.lastDisconnectedAt = extra.lastDisconnectedAt;
+  }
+
+  await identitiesDb.updateAsync(
+    { _id: record.id },
+    { $set: updatePayload },
+    { upsert: true },
+  );
+}
+
+async function persistConnectionEvent(
+  event: Omit<ConnectionEventDoc, "_id" | "timestamp"> & { timestamp?: number },
+) {
+  await connectionsDb.insertAsync({
+    _id: randomUUID(),
+    timestamp: event.timestamp ?? Date.now(),
+    identityId: event.identityId,
+    role: event.role,
+    event: event.event,
+    reason: event.reason,
+    online: event.online,
+    meta: event.meta,
+  });
+}
+
+async function persistMessageLog(
+  message: Omit<MessageLogDoc, "_id" | "timestamp"> & { timestamp?: number },
+) {
+  await messagesDb.insertAsync({
+    _id: randomUUID(),
+    msgId: message.msgId,
+    fromId: message.fromId,
+    fromRole: message.fromRole,
+    requestedTargets: message.requestedTargets,
+    resolvedTargets: message.resolvedTargets,
+    delivered: message.delivered,
+    failed: message.failed,
+    payload: message.payload,
+    timestamp: message.timestamp ?? Date.now(),
+  });
+}
+
+function fireAndForget(task: Promise<unknown>, context: string) {
+  void task.catch((err) => {
+    console.error(`[persist] ${context}:`, err);
+  });
+}
+
 function parseArgs(argv: string[]) {
   const out: {
     port?: number;
     host?: string;
     authkey?: string;
     wsPath?: string;
+    dataDir?: string;
   } = {};
   const positional: string[] = [];
 
@@ -563,6 +878,15 @@ function parseArgs(argv: string[]) {
       i += 1;
       continue;
     }
+    if (current.startsWith("--data-dir=")) {
+      out.dataDir = current.slice("--data-dir=".length);
+      continue;
+    }
+    if (current === "--data-dir") {
+      out.dataDir = argv[i + 1];
+      i += 1;
+      continue;
+    }
     if (!current.startsWith("-")) {
       positional.push(current);
     }
@@ -573,6 +897,9 @@ function parseArgs(argv: string[]) {
   }
   if (!out.authkey && positional[1]) {
     out.authkey = positional[1];
+  }
+  if (!out.dataDir && positional[2]) {
+    out.dataDir = positional[2];
   }
 
   return out;
@@ -595,4 +922,11 @@ function normalizeWsPath(value: string | undefined) {
     return "/ws";
   }
   return value.startsWith("/") ? value : `/${value}`;
+}
+
+function resolveRelayHome(value: string | undefined) {
+  if (!value) {
+    return path.join(os.homedir(), ".mimiclaw-relay");
+  }
+  return path.resolve(value);
 }

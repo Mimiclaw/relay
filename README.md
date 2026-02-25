@@ -7,6 +7,7 @@ Features:
 - WebSocket auth and role identity (`boss` / `employee`)
 - Reconnect with identity recovery (`id + key`)
 - Message routing between any connections
+- Persistent storage with `@seald-io/nedb` for identities, connection events, and message logs
 - HTTP admin APIs (list employees, connection status, ban/unban)
 - `pkg` packaging support for single executable output
 
@@ -21,6 +22,12 @@ Global install (after publish):
 
 ```bash
 npm install -g mimiclaw-ws
+```
+
+When installed globally, `postinstall` will auto-create:
+
+```text
+~/.mimiclaw-relay/
 ```
 
 Global install from local folder:
@@ -60,9 +67,11 @@ Optional args:
 - `--host`: listening host, default `0.0.0.0`
 - `--ws-path`: websocket path, default `/ws`
 - `--authkey`: boss auth key (fallback to `MIMICLAW_AUTHKEY`)
+- `--data-dir`: relay data dir (default `~/.mimiclaw-relay`)
 - positional args are also supported:
   - arg 1: `port`
   - arg 2: `authkey`
+  - arg 3: `data-dir`
 
 ## 3) WebSocket auth protocol
 
@@ -164,6 +173,7 @@ Auth methods:
 Endpoints:
 - `GET /health`: health check (no auth required)
 - `GET /employees`: list employees and online status
+- `GET /connections`: list all identities (boss + employees) and statuses
 - `POST /employees/:id/ban`: ban employee (default `banned=true`)
 - `PUT /employees/:id/ban`: ban/unban with body `{"banned": true|false}`
 - `DELETE /employees/:id/ban`: unban employee
@@ -172,9 +182,15 @@ Examples:
 
 ```bash
 curl "http://127.0.0.1:8787/employees?authkey=your-secret"
+curl "http://127.0.0.1:8787/connections?authkey=your-secret"
 curl -X POST "http://127.0.0.1:8787/employees/employee-xxxx/ban?authkey=your-secret"
 curl -X DELETE "http://127.0.0.1:8787/employees/employee-xxxx/ban?authkey=your-secret"
 ```
+
+Persistent files in relay data dir:
+- `identities.db`: identity records and latest status
+- `connections.db`: auth/reconnect/disconnect/ban event stream
+- `messages.db`: routed message logs between nodes
 
 ## 6) Package with pkg
 

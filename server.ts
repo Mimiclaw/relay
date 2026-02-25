@@ -136,6 +136,7 @@ const HOST = args.host ?? "0.0.0.0";
 const WS_PATH = args.wsPath ?? "/ws";
 const AUTH_KEY = args.authkey ?? process.env.MIMICLAW_AUTHKEY;
 const RELAY_HOME = resolveRelayHome(args.dataDir ?? process.env.MIMICLAW_RELAY_HOME);
+const ADMIN_DIST_DIR = resolveAdminDistDir(args.adminDist ?? process.env.MIMICLAW_ADMIN_DIST);
 const DB_FILES = {
   identities: path.join(RELAY_HOME, "identities.db"),
   connections: path.join(RELAY_HOME, "connections.db"),
@@ -364,6 +365,7 @@ async function bootstrap() {
             port: PORT,
             ws_path: WS_PATH,
             relay_home: RELAY_HOME,
+            admin_dist: ADMIN_DIST_DIR,
           },
           null,
           2,
@@ -387,15 +389,29 @@ function shutdown() {
 function handleHttp(req: IncomingMessage, res: ServerResponse) {
   const method = req.method ?? "GET";
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
-  const path = url.pathname;
+  const requestPath = url.pathname;
+  if (isApiRequestPath(requestPath)) {
+    const apiPath = stripApiPrefix(requestPath);
+    return handleApiHttp(req, res, method, url, apiPath);
+  }
+  return serveAdminStatic(requestPath, res);
+}
 
-  if (path === "/health" && method === "GET") {
+function handleApiHttp(
+  req: IncomingMessage,
+  res: ServerResponse,
+  method: string,
+  url: URL,
+  apiPath: string,
+) {
+  if (apiPath === "/health" && method === "GET") {
     return writeJson(res, 200, {
       ok: true,
       service: "mimiclaw-websocket",
       now: Date.now(),
       active_connections: socketToIdentity.size,
       relay_home: RELAY_HOME,
+      admin_dist: ADMIN_DIST_DIR,
     });
   }
 
@@ -406,27 +422,27 @@ function handleHttp(req: IncomingMessage, res: ServerResponse) {
     });
   }
 
-  if (path === "/employees" && method === "GET") {
+  if (apiPath === "/employees" && method === "GET") {
     return writeJson(res, 200, {
       employees: listEmployees(),
     });
   }
 
-  if (path === "/connections" && method === "GET") {
+  if (apiPath === "/connections" && method === "GET") {
     return writeJson(res, 200, {
       connections: listConnections(),
     });
   }
 
-  if (path === "/admin/workforce" && method === "GET") {
+  if (apiPath === "/admin/workforce" && method === "GET") {
     return writeJson(res, 200, buildAdminWorkforceResponse(url.searchParams));
   }
 
-  if (path === "/admin/communications" && method === "GET") {
+  if (apiPath === "/admin/communications" && method === "GET") {
     return writeJson(res, 200, buildAdminCommunicationsResponse(url.searchParams));
   }
 
-  const banMatch = path.match(/^\/employees\/([^/]+)\/ban$/);
+  const banMatch = apiPath.match(/^\/employees\/([^/]+)\/ban$/);
   if (banMatch && (method === "POST" || method === "PUT")) {
     const employeeId = decodeURIComponent(banMatch[1]);
     return readJsonBody(req)
@@ -468,6 +484,100 @@ function handleHttp(req: IncomingMessage, res: ServerResponse) {
   }
 
   return writeJson(res, 404, { error: "not_found" });
+}
+
+function serveAdminStatic(requestPath: string, res: ServerResponse) {
+  if (!fs.existsSync(ADMIN_DIST_DIR)) {
+    return writeJson(res, 404, {
+      error: "admin_not_built",
+      message: `Admin dist not found at ${ADMIN_DIST_DIR}. Copy admin dist into this path.`,
+    });
+  }
+
+  const normalized = requestPath.replace(/^\/+/, "");
+  const resolved = path.resolve(ADMIN_DIST_DIR, normalized || "index.html");
+  if (!isPathInside(ADMIN_DIST_DIR, resolved)) {
+    return writeJson(res, 403, { error: "forbidden" });
+  }
+
+  if (fs.existsSync(resolved) && fs.statSync(resolved).isFile()) {
+    return streamFile(resolved, res);
+  }
+
+  const fallback = path.join(ADMIN_DIST_DIR, "index.html");
+  if (fs.existsSync(fallback)) {
+    return streamFile(fallback, res);
+  }
+
+  return writeJson(res, 404, { error: "not_found" });
+}
+
+function streamFile(filePath: string, res: ServerResponse) {
+  res.statusCode = 200;
+  res.setHeader("Content-Type", getMimeType(filePath));
+  fs.createReadStream(filePath).pipe(res);
+}
+
+function getMimeType(filePath: string) {
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext === ".html") {
+    return "text/html; charset=utf-8";
+  }
+  if (ext === ".js") {
+    return "application/javascript; charset=utf-8";
+  }
+  if (ext === ".css") {
+    return "text/css; charset=utf-8";
+  }
+  if (ext === ".json") {
+    return "application/json; charset=utf-8";
+  }
+  if (ext === ".png") {
+    return "image/png";
+  }
+  if (ext === ".svg") {
+    return "image/svg+xml";
+  }
+  if (ext === ".jpg" || ext === ".jpeg") {
+    return "image/jpeg";
+  }
+  if (ext === ".ico") {
+    return "image/x-icon";
+  }
+  return "application/octet-stream";
+}
+
+function isPathInside(root: string, target: string) {
+  const rootResolved = path.resolve(root);
+  const targetResolved = path.resolve(target);
+  return targetResolved === rootResolved || targetResolved.startsWith(`${rootResolved}${path.sep}`);
+}
+
+function isApiRequestPath(requestPath: string) {
+  if (requestPath === "/api" || requestPath.startsWith("/api/")) {
+    return true;
+  }
+  if (requestPath === "/health") {
+    return true;
+  }
+  if (requestPath === "/employees" || requestPath === "/connections") {
+    return true;
+  }
+  if (requestPath === "/admin/workforce" || requestPath === "/admin/communications") {
+    return true;
+  }
+  return /^\/employees\/[^/]+\/ban$/.test(requestPath);
+}
+
+function stripApiPrefix(requestPath: string) {
+  if (requestPath === "/api") {
+    return "/";
+  }
+  if (requestPath.startsWith("/api/")) {
+    const stripped = requestPath.slice(4);
+    return stripped.startsWith("/") ? stripped : `/${stripped}`;
+  }
+  return requestPath;
 }
 
 function listEmployees() {
@@ -1300,6 +1410,7 @@ function parseArgs(argv: string[]) {
     authkey?: string;
     wsPath?: string;
     dataDir?: string;
+    adminDist?: string;
   } = {};
   const positional: string[] = [];
 
@@ -1350,6 +1461,15 @@ function parseArgs(argv: string[]) {
       i += 1;
       continue;
     }
+    if (current.startsWith("--admin-dist=")) {
+      out.adminDist = current.slice("--admin-dist=".length);
+      continue;
+    }
+    if (current === "--admin-dist") {
+      out.adminDist = argv[i + 1];
+      i += 1;
+      continue;
+    }
     if (!current.startsWith("-")) {
       positional.push(current);
     }
@@ -1363,6 +1483,9 @@ function parseArgs(argv: string[]) {
   }
   if (!out.dataDir && positional[2]) {
     out.dataDir = positional[2];
+  }
+  if (!out.adminDist && positional[3]) {
+    out.adminDist = positional[3];
   }
 
   return out;
@@ -1417,4 +1540,21 @@ function resolveRelayHome(value: string | undefined) {
     return path.join(os.homedir(), ".mimiclaw-relay");
   }
   return path.resolve(value);
+}
+
+function resolveAdminDistDir(value: string | undefined) {
+  if (value) {
+    return path.resolve(value);
+  }
+  const candidates = [
+    path.resolve(process.cwd(), "admin-dist"),
+    path.resolve(__dirname, "admin-dist"),
+    path.resolve(__dirname, "..", "admin-dist"),
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return candidates[0];
 }

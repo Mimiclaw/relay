@@ -5,6 +5,7 @@ Source code is in `server.ts`.
 
 Features:
 - WebSocket auth and role identity (`boss` / `employee`)
+- Employee profile fields (`name` and `tags[]`) required at first registration
 - Reconnect with identity recovery (`id + key`)
 - Message routing between any connections
 - Persistent storage with `@seald-io/nedb` for identities, connection events, and message logs
@@ -90,9 +91,13 @@ First-time employee auth:
 ```json
 {
   "type": "auth",
-  "role": "employee"
+  "role": "employee",
+  "name": "Researcher-1",
+  "tags": ["research", "solidity", "risk"]
 }
 ```
+
+`name` must be a non-empty string. `tags` must be a non-empty string array.
 
 Reconnect with identity:
 
@@ -107,6 +112,18 @@ Reconnect with identity:
 }
 ```
 
+Optional runtime health report message:
+
+```json
+{
+  "type": "health_report",
+  "valid": true,
+  "details": {
+    "heartbeat": "ok"
+  }
+}
+```
+
 Server auth success response:
 
 ```json
@@ -115,6 +132,8 @@ Server auth success response:
   "id": "employee-xxxx",
   "key": "identity-key",
   "role": "employee",
+  "name": "Researcher-1",
+  "tags": ["research", "solidity", "risk"],
   "reconnected": false,
   "timestamp": 1700000000000
 }
@@ -174,6 +193,8 @@ Endpoints:
 - `GET /health`: health check (no auth required)
 - `GET /employees`: list employees and online status
 - `GET /connections`: list all identities (boss + employees) and statuses
+- `GET /admin/workforce`: admin view with bosses, employees, tag grouping, and health details
+- `GET /admin/communications`: admin comm logs for boss <-> employee messages
 - `POST /employees/:id/ban`: ban employee (default `banned=true`)
 - `PUT /employees/:id/ban`: ban/unban with body `{"banned": true|false}`
 - `DELETE /employees/:id/ban`: unban employee
@@ -183,12 +204,25 @@ Examples:
 ```bash
 curl "http://127.0.0.1:8787/employees?authkey=your-secret"
 curl "http://127.0.0.1:8787/connections?authkey=your-secret"
+curl "http://127.0.0.1:8787/admin/workforce?authkey=your-secret"
+curl "http://127.0.0.1:8787/admin/workforce?authkey=your-secret&tag=research"
+curl "http://127.0.0.1:8787/admin/communications?authkey=your-secret&limit=100&offset=0"
+curl "http://127.0.0.1:8787/admin/communications?authkey=your-secret&boss_id=boss-xxx&employee_id=employee-yyy"
+curl "http://127.0.0.1:8787/admin/communications?authkey=your-secret&tag=solidity&since=1700000000000&until=1700009999999"
 curl -X POST "http://127.0.0.1:8787/employees/employee-xxxx/ban?authkey=your-secret"
 curl -X DELETE "http://127.0.0.1:8787/employees/employee-xxxx/ban?authkey=your-secret"
 ```
 
+`/admin/communications` supports query filters:
+- `limit` (default `50`, max `500`)
+- `offset` (default `0`)
+- `boss_id`
+- `employee_id`
+- `tag` (matches employee tags)
+- `since` / `until` (unix ms timestamp)
+
 Persistent files in relay data dir:
-- `identities.db`: identity records and latest status
+- `identities.db`: identity records (`id`, `role`, `name`, `tags`, status, timestamps)
 - `connections.db`: auth/reconnect/disconnect/ban event stream
 - `messages.db`: routed message logs between nodes
 

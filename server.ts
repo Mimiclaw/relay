@@ -14,6 +14,8 @@ type ClientAuthMessage = {
   type: "auth";
   role: Role;
   authkey?: string;
+  name?: string;
+  tags?: string[];
   identity?: {
     id: string;
     key: string;
@@ -32,7 +34,17 @@ type ClientPingMessage = {
   type: "ping";
 };
 
-type ClientMessage = ClientAuthMessage | ClientRouteMessage | ClientPingMessage;
+type ClientHealthReportMessage = {
+  type: "health_report";
+  valid: boolean;
+  details?: Record<string, unknown>;
+};
+
+type ClientMessage =
+  | ClientAuthMessage
+  | ClientRouteMessage
+  | ClientPingMessage
+  | ClientHealthReportMessage;
 
 type IdentityRecord = {
   id: string;
@@ -41,6 +53,13 @@ type IdentityRecord = {
   banned: boolean;
   createdAt: number;
   lastSeen: number;
+  lastConnectedAt?: number;
+  lastDisconnectedAt?: number;
+  lastHeartbeatAt?: number;
+  lastSelfReportAt?: number;
+  selfReportValid?: boolean;
+  name?: string;
+  tags?: string[];
   meta?: Record<string, unknown>;
   socket?: WebSocket;
 };
@@ -53,6 +72,11 @@ type IdentityDoc = {
   banned: boolean;
   createdAt: number;
   lastSeen: number;
+  lastHeartbeatAt?: number;
+  lastSelfReportAt?: number;
+  selfReportValid?: boolean;
+  name?: string;
+  tags?: string[];
   status: ConnectionStatus;
   lastConnectedAt?: number;
   lastDisconnectedAt?: number;
@@ -84,6 +108,28 @@ type MessageLogDoc = {
   timestamp: number;
 };
 
+type NodeSnapshot = {
+  id: string;
+  role: Role | "unknown";
+  name: string | null;
+  tags: string[];
+};
+
+type AdminCommunicationRow = {
+  msg_id: string;
+  timestamp: number;
+  direction: "boss_to_employee" | "employee_to_boss";
+  boss: NodeSnapshot;
+  employee: NodeSnapshot;
+  from: NodeSnapshot;
+  to: NodeSnapshot;
+  delivery: {
+    status: "delivered" | "failed" | "unknown";
+    reason: string | null;
+  };
+  payload: unknown;
+};
+
 const args = parseArgs(process.argv.slice(2));
 const PORT = args.port ?? 8787;
 const HOST = args.host ?? "0.0.0.0";
@@ -95,6 +141,8 @@ const DB_FILES = {
   connections: path.join(RELAY_HOME, "connections.db"),
   messages: path.join(RELAY_HOME, "messages.db"),
 };
+const HEARTBEAT_STALE_MS = 60_000;
+const SELF_REPORT_STALE_MS = 180_000;
 
 if (!AUTH_KEY) {
   console.error("Missing auth key. Use --authkey=<value> or env MIMICLAW_AUTHKEY.");
@@ -129,6 +177,9 @@ wss.on("connection", (ws) => {
       type: "auth",
       role: "boss|employee",
       authkey: "required for boss",
+      name: "required when role=employee and first-time register",
+      tags: "required string[] when role=employee and first-time register",
+      health_report: { type: "health_report", valid: "boolean", details: "optional object" },
       identity: { id: "optional reconnect id", key: "optional reconnect key" },
     },
   });
@@ -172,10 +223,11 @@ wss.on("connection", (ws) => {
 
       authed = true;
       clearTimeout(authTimer);
+      result.identity.lastConnectedAt = Date.now();
       fireAndForget(
         persistIdentity(result.identity, {
           status: computeStatus(result.identity),
-          lastConnectedAt: Date.now(),
+          lastConnectedAt: result.identity.lastConnectedAt,
         }),
         "persist identity after auth",
       );
@@ -194,6 +246,8 @@ wss.on("connection", (ws) => {
         id: result.identity.id,
         key: result.identity.key,
         role: result.identity.role,
+        name: result.identity.name ?? null,
+        tags: result.identity.tags ?? [],
         reconnected: result.reconnected,
         timestamp: Date.now(),
       });
@@ -217,7 +271,32 @@ wss.on("connection", (ws) => {
     sender.lastSeen = Date.now();
 
     if (msg.type === "ping") {
+      sender.lastHeartbeatAt = Date.now();
+      fireAndForget(
+        persistIdentity(sender, { status: computeStatus(sender) }),
+        "persist sender ping",
+      );
       sendJson(ws, { type: "pong", timestamp: Date.now() });
+      return;
+    }
+
+    if (msg.type === "health_report") {
+      if (typeof msg.valid !== "boolean") {
+        sendError(ws, "invalid_health_report", "Field 'valid' must be boolean.");
+        return;
+      }
+      sender.selfReportValid = msg.valid;
+      sender.lastSelfReportAt = Date.now();
+      fireAndForget(
+        persistIdentity(sender, { status: computeStatus(sender) }),
+        "persist health_report",
+      );
+      sendJson(ws, {
+        type: "health_report_ack",
+        id: sender.id,
+        valid: sender.selfReportValid,
+        timestamp: Date.now(),
+      });
       return;
     }
 
@@ -243,10 +322,11 @@ wss.on("connection", (ws) => {
     if (identity.socket === ws) {
       identity.socket = undefined;
       identity.lastSeen = Date.now();
+      identity.lastDisconnectedAt = Date.now();
       fireAndForget(
         persistIdentity(identity, {
           status: computeStatus(identity),
-          lastDisconnectedAt: Date.now(),
+          lastDisconnectedAt: identity.lastDisconnectedAt,
         }),
         "persist identity on disconnect",
       );
@@ -338,6 +418,14 @@ function handleHttp(req: IncomingMessage, res: ServerResponse) {
     });
   }
 
+  if (path === "/admin/workforce" && method === "GET") {
+    return writeJson(res, 200, buildAdminWorkforceResponse(url.searchParams));
+  }
+
+  if (path === "/admin/communications" && method === "GET") {
+    return writeJson(res, 200, buildAdminCommunicationsResponse(url.searchParams));
+  }
+
   const banMatch = path.match(/^\/employees\/([^/]+)\/ban$/);
   if (banMatch && (method === "POST" || method === "PUT")) {
     const employeeId = decodeURIComponent(banMatch[1]);
@@ -352,6 +440,8 @@ function handleHttp(req: IncomingMessage, res: ServerResponse) {
         return writeJson(res, 200, {
           id: updated.record.id,
           role: updated.record.role,
+          name: updated.record.name ?? null,
+          tags: updated.record.tags ?? [],
           banned: updated.record.banned,
           online: isOnline(updated.record),
         });
@@ -370,6 +460,8 @@ function handleHttp(req: IncomingMessage, res: ServerResponse) {
     return writeJson(res, 200, {
       id: updated.record.id,
       role: updated.record.role,
+      name: updated.record.name ?? null,
+      tags: updated.record.tags ?? [],
       banned: updated.record.banned,
       online: isOnline(updated.record),
     });
@@ -387,6 +479,8 @@ function listEmployees() {
     rows.push({
       id: identity.id,
       role: identity.role,
+      name: identity.name ?? null,
+      tags: identity.tags ?? [],
       online: isOnline(identity),
       status: computeStatus(identity),
       banned: identity.banned,
@@ -405,6 +499,8 @@ function listConnections() {
     rows.push({
       id: identity.id,
       role: identity.role,
+      name: identity.name ?? null,
+      tags: identity.tags ?? [],
       online: isOnline(identity),
       status: computeStatus(identity),
       banned: identity.banned,
@@ -415,6 +511,237 @@ function listConnections() {
   }
   rows.sort((a, b) => String(a.id).localeCompare(String(b.id)));
   return rows;
+}
+
+function buildAdminWorkforceResponse(params: URLSearchParams) {
+  const tagFilter = params.get("tag")?.trim();
+  const now = Date.now();
+  const bosses: Array<Record<string, unknown>> = [];
+  const employees: Array<Record<string, unknown>> = [];
+  const employeesByTag = new Map<string, Array<Record<string, unknown>>>();
+  const healthCounters = { healthy: 0, degraded: 0, unhealthy: 0 };
+  let onlineCount = 0;
+  let offlineCount = 0;
+  let bannedCount = 0;
+
+  const sorted = Array.from(identities.values()).sort((a, b) => a.id.localeCompare(b.id));
+  for (const identity of sorted) {
+    const health = computeHealthDetails(identity, now);
+    if (health.overall === "healthy") {
+      healthCounters.healthy += 1;
+    } else if (health.overall === "degraded") {
+      healthCounters.degraded += 1;
+    } else {
+      healthCounters.unhealthy += 1;
+    }
+
+    if (isOnline(identity)) {
+      onlineCount += 1;
+    } else {
+      offlineCount += 1;
+    }
+    if (identity.banned) {
+      bannedCount += 1;
+    }
+
+    const node = {
+      id: identity.id,
+      role: identity.role,
+      name: identity.name ?? null,
+      tags: identity.tags ?? [],
+      status: computeStatus(identity),
+      online: isOnline(identity),
+      banned: identity.banned,
+      created_at: identity.createdAt,
+      last_seen: identity.lastSeen,
+      health,
+      meta: identity.meta ?? null,
+    };
+
+    if (identity.role === "boss") {
+      bosses.push(node);
+      continue;
+    }
+
+    if (tagFilter) {
+      const tags = identity.tags ?? [];
+      if (!tags.includes(tagFilter)) {
+        continue;
+      }
+    }
+    employees.push(node);
+
+    const tags = identity.tags ?? [];
+    for (const tag of tags) {
+      if (!employeesByTag.has(tag)) {
+        employeesByTag.set(tag, []);
+      }
+      employeesByTag.get(tag)?.push(node);
+    }
+  }
+
+  const tags: Record<string, unknown> = {};
+  for (const [tag, items] of employeesByTag.entries()) {
+    tags[tag] = {
+      count: items.length,
+      employee_ids: items.map((item) => item.id),
+      employees: items,
+    };
+  }
+
+  return {
+    summary: {
+      total_nodes: identities.size,
+      boss_count: bosses.length,
+      employee_count: employees.length,
+      online_count: onlineCount,
+      offline_count: offlineCount,
+      banned_count: bannedCount,
+      health: healthCounters,
+      filtered_by_tag: tagFilter ?? null,
+    },
+    bosses,
+    employees,
+    employees_by_tag: tags,
+    timestamp: now,
+  };
+}
+
+function buildAdminCommunicationsResponse(params: URLSearchParams) {
+  const now = Date.now();
+  const bossIdFilter = params.get("boss_id")?.trim();
+  const employeeIdFilter = params.get("employee_id")?.trim();
+  const tagFilter = params.get("tag")?.trim();
+  const since = parseOptionalInt(params.get("since"));
+  const until = parseOptionalInt(params.get("until"));
+  const limit = parseBoundedInt(params.get("limit"), 50, 1, 500);
+  const offset = parseBoundedInt(params.get("offset"), 0, 0, Number.MAX_SAFE_INTEGER);
+
+  const messageDocs = messagesDb
+    .getAllData<MessageLogDoc>()
+    .slice()
+    .sort((a, b) => b.timestamp - a.timestamp);
+
+  const rows: Array<Record<string, unknown>> = [];
+  for (const doc of messageDocs) {
+    if (since !== null && doc.timestamp < since) {
+      continue;
+    }
+    if (until !== null && doc.timestamp > until) {
+      continue;
+    }
+
+    const targets = Array.from(new Set([
+      ...doc.resolvedTargets,
+      ...doc.delivered,
+      ...doc.failed.map((item) => item.id),
+    ]));
+    for (const toId of targets) {
+      const edge = buildBossEmployeeEdge(doc, toId);
+      if (!edge) {
+        continue;
+      }
+
+      const edgeBossId = edge.boss.id;
+      const edgeEmployeeId = edge.employee.id;
+      if (bossIdFilter && edgeBossId !== bossIdFilter) {
+        continue;
+      }
+      if (employeeIdFilter && edgeEmployeeId !== employeeIdFilter) {
+        continue;
+      }
+      if (tagFilter) {
+        const tags = edge.employee.tags ?? [];
+        if (!tags.includes(tagFilter)) {
+          continue;
+        }
+      }
+
+      rows.push(edge);
+    }
+  }
+
+  const total = rows.length;
+  const paged = rows.slice(offset, offset + limit);
+  return {
+    total,
+    offset,
+    limit,
+    filters: {
+      boss_id: bossIdFilter ?? null,
+      employee_id: employeeIdFilter ?? null,
+      tag: tagFilter ?? null,
+      since,
+      until,
+    },
+    rows: paged,
+    timestamp: now,
+  };
+}
+
+function buildBossEmployeeEdge(doc: MessageLogDoc, toId: string): AdminCommunicationRow | null {
+  const fromIdentity = identities.get(doc.fromId);
+  const toIdentity = identities.get(toId);
+  const fromRole = fromIdentity?.role ?? inferRoleFromId(doc.fromId);
+  const toRole = toIdentity?.role ?? inferRoleFromId(toId);
+
+  const isBossToEmployee = fromRole === "boss" && toRole === "employee";
+  const isEmployeeToBoss = fromRole === "employee" && toRole === "boss";
+  if (!isBossToEmployee && !isEmployeeToBoss) {
+    return null;
+  }
+
+  const failed = doc.failed.find((item) => item.id === toId);
+  let delivery: AdminCommunicationRow["delivery"];
+  if (failed) {
+    delivery = { status: "failed", reason: failed.reason };
+  } else if (doc.delivered.includes(toId)) {
+    delivery = { status: "delivered", reason: null };
+  } else {
+    delivery = { status: "unknown", reason: null };
+  }
+
+  const boss = isBossToEmployee
+    ? toNodeSnapshot(doc.fromId, "boss", fromIdentity)
+    : toNodeSnapshot(toId, "boss", toIdentity);
+  const employee = isBossToEmployee
+    ? toNodeSnapshot(toId, "employee", toIdentity)
+    : toNodeSnapshot(doc.fromId, "employee", fromIdentity);
+
+  return {
+    msg_id: doc.msgId,
+    timestamp: doc.timestamp,
+    direction: isBossToEmployee ? "boss_to_employee" : "employee_to_boss",
+    boss,
+    employee,
+    from: toNodeSnapshot(doc.fromId, fromRole, fromIdentity),
+    to: toNodeSnapshot(toId, toRole, toIdentity),
+    delivery,
+    payload: doc.payload,
+  };
+}
+
+function toNodeSnapshot(
+  id: string,
+  role: Role | "unknown",
+  identity?: IdentityRecord,
+): NodeSnapshot {
+  return {
+    id,
+    role,
+    name: identity?.name ?? null,
+    tags: identity?.tags ?? [],
+  };
+}
+
+function inferRoleFromId(id: string): Role | "unknown" {
+  if (id.startsWith("boss-")) {
+    return "boss";
+  }
+  if (id.startsWith("employee-")) {
+    return "employee";
+  }
+  return "unknown";
 }
 
 function isAuthorizedHttp(req: IncomingMessage, url: URL) {
@@ -434,6 +761,10 @@ function authenticateSocket(
 
   if (msg.role === "boss" && msg.authkey !== AUTH_KEY) {
     return { ok: false, code: "invalid_authkey", message: "Boss auth key invalid." };
+  }
+
+  if (msg.role === "employee" && msg.authkey && msg.authkey !== AUTH_KEY) {
+    return { ok: false, code: "invalid_authkey", message: "Provided auth key is invalid." };
   }
 
   if (msg.identity?.id || msg.identity?.key) {
@@ -466,12 +797,27 @@ function authenticateSocket(
     if (msg.meta) {
       existing.meta = msg.meta;
     }
+    if (existing.role === "employee" && (msg.name !== undefined || msg.tags !== undefined)) {
+      const profile = validateEmployeeProfile(msg, false);
+      if (profile.ok === false) {
+        return { ok: false, code: profile.code, message: profile.message };
+      }
+      existing.name = profile.name;
+      existing.tags = profile.tags;
+    }
     socketToIdentity.set(ws, existing.id);
     return { ok: true, identity: existing, reconnected: true };
   }
 
-  if (msg.role === "employee" && msg.authkey && msg.authkey !== AUTH_KEY) {
-    return { ok: false, code: "invalid_authkey", message: "Provided auth key is invalid." };
+  let employeeName: string | undefined;
+  let employeeTags: string[] | undefined;
+  if (msg.role === "employee") {
+    const profile = validateEmployeeProfile(msg, true);
+    if (profile.ok === false) {
+      return { ok: false, code: profile.code, message: profile.message };
+    }
+    employeeName = profile.name;
+    employeeTags = profile.tags;
   }
 
   const now = Date.now();
@@ -482,12 +828,52 @@ function authenticateSocket(
     banned: false,
     createdAt: now,
     lastSeen: now,
+    name: employeeName,
+    tags: employeeTags,
     meta: msg.meta,
     socket: ws,
   };
   identities.set(newIdentity.id, newIdentity);
   socketToIdentity.set(ws, newIdentity.id);
   return { ok: true, identity: newIdentity, reconnected: false };
+}
+
+function validateEmployeeProfile(
+  msg: ClientAuthMessage,
+  required: boolean,
+): { ok: true; name: string; tags: string[] } | { ok: false; code: string; message: string } {
+  if (!required && msg.name === undefined && msg.tags === undefined) {
+    return { ok: true, name: "", tags: [] };
+  }
+
+  if (typeof msg.name !== "string" || !msg.name.trim()) {
+    return {
+      ok: false,
+      code: "invalid_name",
+      message: "Employee registration requires a non-empty name.",
+    };
+  }
+
+  if (!Array.isArray(msg.tags)) {
+    return {
+      ok: false,
+      code: "invalid_tags",
+      message: "Employee registration requires tags as string array.",
+    };
+  }
+
+  const tags = msg.tags
+    .map((tag) => String(tag).trim())
+    .filter((tag) => tag.length > 0);
+  if (tags.length === 0) {
+    return {
+      ok: false,
+      code: "invalid_tags",
+      message: "Employee registration requires at least one tag.",
+    };
+  }
+
+  return { ok: true, name: msg.name.trim(), tags: Array.from(new Set(tags)) };
 }
 
 function routeMessage(sender: IdentityRecord, msg: ClientRouteMessage, ws: WebSocket) {
@@ -696,6 +1082,66 @@ function computeStatus(record: IdentityRecord): ConnectionStatus {
   return isOnline(record) ? "online" : "offline";
 }
 
+function computeHealthDetails(record: IdentityRecord, now: number) {
+  const status = computeStatus(record);
+  const online = isOnline(record);
+  const heartbeatAgeMs = typeof record.lastSeen === "number" ? Math.max(0, now - record.lastSeen) : null;
+  const heartbeatStale = heartbeatAgeMs === null ? true : heartbeatAgeMs > HEARTBEAT_STALE_MS;
+  const selfReportAgeMs =
+    typeof record.lastSelfReportAt === "number" ? Math.max(0, now - record.lastSelfReportAt) : null;
+  const selfReportStale = selfReportAgeMs !== null ? selfReportAgeMs > SELF_REPORT_STALE_MS : true;
+
+  const reasons: string[] = [];
+  let overall: "healthy" | "degraded" | "unhealthy" = "healthy";
+  if (record.banned) {
+    overall = "unhealthy";
+    reasons.push("banned");
+  } else if (!online) {
+    overall = "unhealthy";
+    reasons.push("offline");
+  } else {
+    if (heartbeatStale) {
+      overall = "degraded";
+      reasons.push("heartbeat_stale");
+    }
+    if (record.selfReportValid === false) {
+      overall = "degraded";
+      reasons.push("self_report_invalid");
+    } else if (record.selfReportValid === undefined) {
+      overall = "degraded";
+      reasons.push("self_report_missing");
+    } else if (selfReportStale) {
+      overall = "degraded";
+      reasons.push("self_report_stale");
+    }
+  }
+
+  return {
+    overall,
+    reasons,
+    status,
+    online,
+    heartbeat: {
+      last_seen_at: record.lastSeen,
+      age_ms: heartbeatAgeMs,
+      stale: heartbeatStale,
+      stale_threshold_ms: HEARTBEAT_STALE_MS,
+    },
+    self_report: {
+      valid: record.selfReportValid ?? null,
+      last_report_at: record.lastSelfReportAt ?? null,
+      age_ms: selfReportAgeMs,
+      stale: selfReportStale,
+      stale_threshold_ms: SELF_REPORT_STALE_MS,
+    },
+    connection: {
+      last_connected_at: record.lastConnectedAt ?? null,
+      last_disconnected_at: record.lastDisconnectedAt ?? null,
+      websocket_open: online,
+    },
+  };
+}
+
 function ensureRelayHome(dir: string) {
   fs.mkdirSync(dir, { recursive: true });
 }
@@ -725,6 +1171,9 @@ async function initDatastores() {
 
   await Promise.all([
     identitiesDb.ensureIndexAsync({ fieldName: "id", unique: true }),
+    identitiesDb.ensureIndexAsync({ fieldName: "role" }),
+    identitiesDb.ensureIndexAsync({ fieldName: "status" }),
+    identitiesDb.ensureIndexAsync({ fieldName: "tags" }),
     connectionsDb.ensureIndexAsync({ fieldName: "identityId" }),
     connectionsDb.ensureIndexAsync({ fieldName: "timestamp" }),
     messagesDb.ensureIndexAsync({ fieldName: "msgId" }),
@@ -753,6 +1202,13 @@ async function restoreIdentitiesFromDisk() {
       banned: !!doc.banned,
       createdAt: doc.createdAt ?? Date.now(),
       lastSeen: doc.lastSeen ?? Date.now(),
+      lastConnectedAt: doc.lastConnectedAt,
+      lastDisconnectedAt: doc.lastDisconnectedAt,
+      lastHeartbeatAt: doc.lastHeartbeatAt,
+      lastSelfReportAt: doc.lastSelfReportAt,
+      selfReportValid: typeof doc.selfReportValid === "boolean" ? doc.selfReportValid : undefined,
+      name: typeof doc.name === "string" ? doc.name : undefined,
+      tags: Array.isArray(doc.tags) ? doc.tags.map((v) => String(v)).filter(Boolean) : undefined,
       meta: doc.meta,
     });
   }
@@ -774,6 +1230,13 @@ async function persistIdentity(
     banned: record.banned,
     createdAt: record.createdAt,
     lastSeen: record.lastSeen,
+    lastConnectedAt: record.lastConnectedAt,
+    lastDisconnectedAt: record.lastDisconnectedAt,
+    lastHeartbeatAt: record.lastHeartbeatAt,
+    lastSelfReportAt: record.lastSelfReportAt,
+    selfReportValid: record.selfReportValid,
+    name: record.name,
+    tags: record.tags,
     meta: record.meta,
     status: extra?.status ?? computeStatus(record),
     updatedAt: now,
@@ -915,6 +1378,31 @@ function parsePort(value: string | undefined) {
     return fallback;
   }
   return Math.floor(num);
+}
+
+function parseOptionalInt(value: string | null) {
+  if (value === null || value.trim() === "") {
+    return null;
+  }
+  const num = Number(value);
+  if (!Number.isFinite(num)) {
+    return null;
+  }
+  return Math.floor(num);
+}
+
+function parseBoundedInt(value: string | null, fallback: number, min: number, max: number) {
+  const parsed = parseOptionalInt(value);
+  if (parsed === null) {
+    return fallback;
+  }
+  if (parsed < min) {
+    return min;
+  }
+  if (parsed > max) {
+    return max;
+  }
+  return parsed;
 }
 
 function normalizeWsPath(value: string | undefined) {

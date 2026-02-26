@@ -415,13 +415,6 @@ function handleApiHttp(
     });
   }
 
-  if (!isAuthorizedHttp(req, url)) {
-    return writeJson(res, 401, {
-      error: "unauthorized",
-      message: "Provide auth key via x-auth-key header or authkey query param.",
-    });
-  }
-
   if (apiPath === "/employees" && method === "GET") {
     return writeJson(res, 200, {
       employees: listEmployees(),
@@ -440,6 +433,13 @@ function handleApiHttp(
 
   if (apiPath === "/admin/communications" && method === "GET") {
     return writeJson(res, 200, buildAdminCommunicationsResponse(url.searchParams));
+  }
+
+  if (!isAuthorizedHttp(req, url)) {
+    return writeJson(res, 401, {
+      error: "unauthorized",
+      message: "Write operations require auth key via x-auth-key header or authkey query param.",
+    });
   }
 
   const banMatch = apiPath.match(/^\/employees\/([^/]+)\/ban$/);

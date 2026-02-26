@@ -183,18 +183,18 @@ Sender receives delivery ack:
 }
 ```
 
-## 5) HTTP admin APIs (boss only)
+## 5) HTTP admin APIs
 
-Auth methods:
+Auth methods (write endpoints only):
 - header: `x-auth-key: your-secret`
 - query: `?authkey=your-secret`
 
 Endpoints:
 - `GET /health`: health check (no auth required)
-- `GET /employees`: list employees and online status
-- `GET /connections`: list all identities (boss + employees) and statuses
-- `GET /admin/workforce`: admin view with bosses, employees, tag grouping, and health details
-- `GET /admin/communications`: admin comm logs for boss <-> employee messages
+- `GET /employees`: list employees and online status (no auth required)
+- `GET /connections`: list all identities (boss + employees) and statuses (no auth required)
+- `GET /admin/workforce`: admin view with bosses, employees, tag grouping, and health details (no auth required)
+- `GET /admin/communications`: admin comm logs for boss <-> employee messages (no auth required)
 - `POST /employees/:id/ban`: ban employee (default `banned=true`)
 - `PUT /employees/:id/ban`: ban/unban with body `{"banned": true|false}`
 - `DELETE /employees/:id/ban`: unban employee
@@ -202,13 +202,13 @@ Endpoints:
 Examples:
 
 ```bash
-curl "http://127.0.0.1:8787/employees?authkey=your-secret"
-curl "http://127.0.0.1:8787/connections?authkey=your-secret"
-curl "http://127.0.0.1:8787/admin/workforce?authkey=your-secret"
-curl "http://127.0.0.1:8787/admin/workforce?authkey=your-secret&tag=research"
-curl "http://127.0.0.1:8787/admin/communications?authkey=your-secret&limit=100&offset=0"
-curl "http://127.0.0.1:8787/admin/communications?authkey=your-secret&boss_id=boss-xxx&employee_id=employee-yyy"
-curl "http://127.0.0.1:8787/admin/communications?authkey=your-secret&tag=solidity&since=1700000000000&until=1700009999999"
+curl "http://127.0.0.1:8787/employees"
+curl "http://127.0.0.1:8787/connections"
+curl "http://127.0.0.1:8787/admin/workforce"
+curl "http://127.0.0.1:8787/admin/workforce?tag=research"
+curl "http://127.0.0.1:8787/admin/communications?limit=100&offset=0"
+curl "http://127.0.0.1:8787/admin/communications?boss_id=boss-xxx&employee_id=employee-yyy"
+curl "http://127.0.0.1:8787/admin/communications?tag=solidity&since=1700000000000&until=1700009999999"
 curl -X POST "http://127.0.0.1:8787/employees/employee-xxxx/ban?authkey=your-secret"
 curl -X DELETE "http://127.0.0.1:8787/employees/employee-xxxx/ban?authkey=your-secret"
 ```

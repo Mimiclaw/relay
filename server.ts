@@ -1546,10 +1546,12 @@ function resolveAdminDistDir(value: string | undefined) {
   if (value) {
     return path.resolve(value);
   }
+  const exeDir = path.dirname(process.execPath);
   const candidates = [
-    path.resolve(process.cwd(), "admin-dist"),
-    path.resolve(__dirname, "admin-dist"),
     path.resolve(__dirname, "..", "admin-dist"),
+    path.resolve(__dirname, "admin-dist"),
+    path.resolve(exeDir, "admin-dist"),
+    path.resolve(process.cwd(), "admin-dist"),
   ];
   for (const candidate of candidates) {
     if (fs.existsSync(candidate)) {

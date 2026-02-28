@@ -1,6 +1,6 @@
 {
   "name": "mimiclaw-ws",
-  "version": "0.1.1",
+  "version": "0.1.3",
   "private": false,
   "description": "Mimiclaw workforce websocket service (single-file Node.js/TypeScript, pkg-ready).",
   "main": "dist/server.js",
@@ -9,13 +9,19 @@
   },
   "files": [
     "dist",
-    "README.md"
+    "admin-dist",
+    "README.md",
+    "interface.md",
+    "worker_ws.md",
+    "boss_ws.md"
   ],
   "license": "MIT",
   "scripts": {
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true});require('fs').rmSync('release',{recursive:true,force:true});\"",
     "typecheck": "tsc server.ts --module commonjs --target es2020 --esModuleInterop --moduleResolution node --skipLibCheck --noEmit",
-    "build": "npm run clean && tsc server.ts --module commonjs --target es2020 --esModuleInterop --moduleResolution node --skipLibCheck --outDir dist",
+    "build:server": "tsc server.ts --module commonjs --target es2020 --esModuleInterop --moduleResolution node --skipLibCheck --outDir dist",
+    "sync:admin-dist": "node -e \"const fs=require('fs');const path=require('path');const cwd=process.cwd();const src=path.resolve(cwd,'..','admin','dist');const dst=path.resolve(cwd,'admin-dist');if(fs.existsSync(src)){fs.rmSync(dst,{recursive:true,force:true});fs.cpSync(src,dst,{recursive:true});console.log('[mimiclaw-ws] synced admin-dist from',src);}else if(fs.existsSync(dst)){console.log('[mimiclaw-ws] keep existing admin-dist at',dst);}else{console.error('[mimiclaw-ws] missing admin assets. Build ../admin first (pnpm build or npm run build), or place files in websocket/admin-dist');process.exit(1);}\"",
+    "build": "npm run clean && npm run build:server && npm run sync:admin-dist",
     "start": "node dist/server.js",
     "build:pkg": "npm run build && pkg dist/server.js --targets node20-win-x64,node20-linux-x64,node20-macos-x64 --out-path release",
     "prepack": "npm run build",
